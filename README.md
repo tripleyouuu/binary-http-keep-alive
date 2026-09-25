@@ -2,6 +2,10 @@
 
 A binary framing of HTTP (BHTTP/1), with a server and a client written in plain Python using only sockets. The server is a calculator. Every request and response travels over a single persistent TCP connection.
 
+## Disclaimer
+
+This was made for an assignment as part of my computer science degree - not intended to be used as a standalone project or anything serious.
+
 ## Files
 
 | File | What it is |
