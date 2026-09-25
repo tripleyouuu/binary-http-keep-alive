@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+import argparse
+import socket
+import sys
+
+HEADERS = 0x1
+DATA = 0x2
+END_MESSAGE = 0x1
+NAMES = [None, ":method", ":path", ":status", "host", "user-agent", "accept",
+         "content-type", "content-length", "server", "connection"]
+INDEX = {name: i for i, name in enumerate(NAMES) if name}
+
+
+def frame(ftype, flags, payload):
+    return len(payload).to_bytes(3, "big") + bytes([ftype, flags]) + payload
+
+
+def encode(fields):
+    out = b""
+    for name, value in fields:
+        data = value.encode()
+        if name in INDEX:
+            out += bytes([INDEX[name]])
+        else:
+            raw = name.encode()
+            out += bytes([0, len(raw)]) + raw
+        out += len(data).to_bytes(2, "big") + data
+    return out
+
+
+def decode(block):
+    fields = {}
+    pos = 0
+
+    def take(n):
+        nonlocal pos
+        if pos + n > len(block):
+            raise ValueError("malformed header block")
+        pos += n
+        return block[pos - n:pos]
+
+    while pos < len(block):
+        index = take(1)[0]
+        if index == 0:
+            name = take(take(1)[0]).decode()
+        else:
+            name = NAMES[index] if index < len(NAMES) else None
+        value = take(int.from_bytes(take(2), "big")).decode()
+        if name is not None:
+            fields[name] = value
+    return fields
+
+
+def read_exact(f, n):
+    data = f.read(n)
+    if len(data) < n:
+        raise EOFError("connection closed by server")
+    return data
+
+
+def hexdump(prefix, data):
+    for i in range(0, len(data), 16):
+        chunk = data[i:i + 16]
+        hexes = " ".join(f"{b:02x}" for b in chunk)
+        text = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        print(f"{prefix} {i:04x}  {hexes:<47}  {text}", file=sys.stderr)
+
+
+def read_response(f, verbose):
+    block = None
+    body = b""
+    while True:
+        head = read_exact(f, 5)
+        payload = read_exact(f, int.from_bytes(head[:3], "big"))
+        if verbose:
+            hexdump("<", head + payload)
+        ftype, flags = head[3], head[4]
+        if ftype == HEADERS and block is None:
+            block = payload
+        elif ftype == DATA and block is not None:
+            body += payload
+        elif ftype in (HEADERS, DATA):
+            raise ValueError("unexpected frame")
+        else:
+            continue
+        if flags & END_MESSAGE:
+            return decode(block), body
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="bcurl")
+    parser.add_argument("-v", action="store_true")
+    parser.add_argument("-X", default="GET")
+    parser.add_argument("url")
+    parser.add_argument("paths", nargs="*")
+    args = parser.parse_args()
+
+    authority, _, rest = args.url.partition("/")
+    host, _, port = authority.partition(":")
+    paths = ["/" + rest] + args.paths
+    failed = False
+
+    with socket.create_connection((host, int(port or 9000))) as sock:
+        f = sock.makefile("rb")
+        for i, path in enumerate(paths):
+            fields = [
+                (":method", args.X),
+                (":path", path),
+                ("host", authority),
+                ("user-agent", "bcurl"),
+                ("accept", "text/plain"),
+                ("connection", "close" if i == len(paths) - 1 else "keep-alive"),
+            ]
+            request = frame(HEADERS, END_MESSAGE, encode(fields))
+            if args.v:
+                hexdump(">", request)
+            sock.sendall(request)
+            response, body = read_response(f, args.v)
+            if body:
+                sys.stdout.buffer.write(body + b"\n")
+                sys.stdout.buffer.flush()
+            if int(response[":status"]) >= 400:
+                failed = True
+
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()

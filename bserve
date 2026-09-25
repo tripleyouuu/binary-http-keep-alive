@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+import re
+import socket
+import sys
+import threading
+from urllib.parse import parse_qs, urlsplit
+
+HEADERS = 0x1
+DATA = 0x2
+END_MESSAGE = 0x1
+IDLE_TIMEOUT = 120
+NAMES = [None, ":method", ":path", ":status", "host", "user-agent", "accept",
+         "content-type", "content-length", "server", "connection"]
+INDEX = {name: i for i, name in enumerate(NAMES) if name}
+INTEGER = re.compile(r"-?[0-9]+")
+
+
+class ProtocolError(Exception):
+    pass
+
+
+def frame(ftype, flags, payload):
+    return len(payload).to_bytes(3, "big") + bytes([ftype, flags]) + payload
+
+
+def encode(fields):
+    out = b""
+    for name, value in fields:
+        data = value.encode()
+        if name in INDEX:
+            out += bytes([INDEX[name]])
+        else:
+            raw = name.encode()
+            out += bytes([0, len(raw)]) + raw
+        out += len(data).to_bytes(2, "big") + data
+    return out
+
+
+def decode(block):
+    fields = {}
+    pos = 0
+
+    def take(n):
+        nonlocal pos
+        if pos + n > len(block):
+            raise ValueError
+        pos += n
+        return block[pos - n:pos]
+
+    while pos < len(block):
+        index = take(1)[0]
+        if index == 0:
+            name = take(take(1)[0]).decode()
+        else:
+            name = NAMES[index] if index < len(NAMES) else None
+        value = take(int.from_bytes(take(2), "big")).decode()
+        if name is not None:
+            fields[name] = value
+    return fields
+
+
+def read_exact(f, n):
+    data = f.read(n)
+    if len(data) < n:
+        raise EOFError
+    return data
+
+
+def read_message(f):
+    block = None
+    while True:
+        head = f.read(5)
+        if not head and block is None:
+            return None
+        if len(head) < 5:
+            raise EOFError
+        payload = read_exact(f, int.from_bytes(head[:3], "big"))
+        ftype, flags = head[3], head[4]
+        if ftype == HEADERS:
+            if block is not None:
+                raise ProtocolError
+            block = payload
+        elif ftype == DATA:
+            if block is None:
+                raise ProtocolError
+        else:
+            continue
+        if flags & END_MESSAGE:
+            return block
+
+
+def respond(conn, status, body=b"", close=False):
+    fields = [(":status", str(status)), ("server", "bserve"),
+              ("connection", "close" if close else "keep-alive")]
+    if not body:
+        conn.sendall(frame(HEADERS, END_MESSAGE, encode(fields)))
+        return
+    fields += [("content-type", "text/plain"), ("content-length", str(len(body)))]
+    conn.sendall(frame(HEADERS, 0, encode(fields)) + frame(DATA, END_MESSAGE, body))
+
+
+def divide(a, b):
+    quotient, remainder = divmod(a, b)
+    return str(quotient) if remainder == 0 else repr(a / b)
+
+
+OPERATIONS = {
+    "/add": lambda a, b: str(a + b),
+    "/sub": lambda a, b: str(a - b),
+    "/mul": lambda a, b: str(a * b),
+    "/div": divide,
+}
+
+
+def handle(fields):
+    if not {":method", ":path", "host"} <= fields.keys():
+        return 400, ""
+    url = urlsplit(fields[":path"])
+    operation = OPERATIONS.get(url.path)
+    if operation is None:
+        return 404, ""
+    if fields[":method"] != "GET":
+        return 405, ""
+    query = parse_qs(url.query)
+    a = query.get("a", [""])[0]
+    b = query.get("b", [""])[0]
+    if not INTEGER.fullmatch(a) or not INTEGER.fullmatch(b):
+        return 400, ""
+    try:
+        return 200, operation(int(a), int(b))
+    except (ZeroDivisionError, OverflowError, ValueError):
+        return 400, ""
+
+
+def serve(conn):
+    conn.settimeout(IDLE_TIMEOUT)
+    f = conn.makefile("rb")
+    try:
+        while True:
+            try:
+                block = read_message(f)
+            except ProtocolError:
+                respond(conn, 400, close=True)
+                return
+            if block is None:
+                return
+            try:
+                fields = decode(block)
+            except ValueError:
+                respond(conn, 400)
+                continue
+            status, body = handle(fields)
+            close = fields.get("connection") == "close"
+            respond(conn, status, body.encode(), close)
+            if close:
+                return
+    except (EOFError, OSError):
+        pass
+    finally:
+        f.close()
+        conn.close()
+
+
+def main():
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 9000
+    server = socket.create_server(("", port))
+    while True:
+        conn, _ = server.accept()
+        threading.Thread(target=serve, args=(conn,), daemon=True).start()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
